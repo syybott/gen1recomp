@@ -148,6 +148,18 @@ older iOS-only `"stadium"` picker kind remains temporarily for compatibility.
 Android now returns `false` for unknown picker kinds instead of treating them
 as game-ROM picks.
 
+### Platform import flow
+
+The same per-mod validation and private `mods/<mod-id>/baseroms/` destination
+applies on every supported platform. Windows, macOS, and Linux use the
+launcher file chooser. Android uses the Storage Access Framework, and iOS uses
+the Files document picker; both stage the choice as `picked_required_import.bin`
+before validation. Xbox/UWP uses its native picker and hands the launcher a
+temporary path. Switch/NX has no host picker, so the player copies a file to
+`imports/baseroms/` over MTP and chooses the import again. No platform grants
+the mod a host filesystem path or bypasses the manifest's size, format, and MD5
+checks.
+
 ## Mods and Gold (Gen 2)
 
 The mod API is one API across both generations, but Gold runs its own battle
@@ -802,3 +814,157 @@ the native side's pending file itself, each permissioned mod receives its
 own copy of a delivery, and steps are anchored natively so the same walk
 is never delivered twice. Without the permission, `sync` and `poll` raise
 an error naming it.
+
+## Background HTTP
+
+`mod.fetch` is how a mod does work off the main thread. It is behind the
+`network` permission in `manifest.json`, the same one that gates
+`require("socket")`, and the player sees it in the mod manager.
+
+```lua
+-- somewhere once
+local job = mod.fetch:get("https://example.com/data.json")
+
+-- in a hook or update, every frame -- poll never blocks
+if job then
+  local r = mod.fetch:poll(job)
+  if r.status ~= "pending" then
+    if r.status == "ok" then use(r.body) else warn(r.err) end
+    mod.fetch:release(job)
+    job = nil
+  end
+end
+```
+
+`get(url, opts)` returns an opaque handle, or `nil` plus a reason. `opts`
+takes `accept` (a request Accept header) and `maxSeconds` (clamped to 30).
+`poll(handle)` returns `{ status, body, err, progress }` where `status` is
+`"pending"`, `"ok"`, `"error"` or `"cancelled"`; it is a copy, and it never
+blocks, so calling it every frame is the intended use. `release(handle)`
+frees a finished job — do it, or you will hit the ceiling. `cancel(handle)`
+drops a result you no longer want. `available()` is `false` when the build
+has no transport and for mods without the permission, so a probe is safe.
+
+The rules worth knowing before you design around it:
+
+- **http and https only.** The underlying transport also speaks `file://`,
+  `ftp://` and `scp://`; those are refused, on the initial URL and on any
+  redirect. `mod.fetch` is not a way to read a local file.
+- **Four requests in flight per mod.** The worker pool is shared with the
+  launcher's own downloads, so one mod cannot fill it. Over the ceiling,
+  `get` returns `nil` and a reason until you release something.
+- **Handles are yours alone.** A handle from another mod, a fabricated
+  table, or a guessed number all poll as `"error"`.
+- **Your mod id is in the User-Agent**, so a server operator can see who is
+  calling and a mod cannot pose as the launcher.
+- Jobs are released when your mod unloads.
+
+This is deliberately not `love.thread`. A LÖVE thread is a fresh Lua state
+with a full standard library that the sandbox cannot reach, so handing one
+to a mod would undo every other rule; `mod.fetch`'s workers run engine
+code, so a mod gets asynchrony without gaining any new reach.
+
+## Background jobs
+
+`mod.fetch` covers work waiting on a server. `mod.job` covers work waiting on
+the CPU — generating a map, crunching a table, anything that would otherwise
+stall a frame. It is behind the `background` permission in `manifest.json`.
+
+Ship the job as its own file inside your mod:
+
+```lua
+-- mods/your_mod/jobs/crunch.lua
+local arg = ...
+local total = 0
+for i = 1, arg.n do total = total + i end
+return { total = total }
+```
+
+```lua
+-- in your entry file
+local job = mod.job:run("jobs/crunch.lua", { n = 1e6 })
+
+-- later, in a hook -- poll never blocks
+local r = mod.job:poll(job)
+if r.status == "ok" then
+  use(r.result.total)
+  mod.job:release(job)
+end
+```
+
+`run(script, arg, opts)` returns an opaque handle, or `nil` plus a reason.
+`opts.maxSeconds` sets the job's time budget (default 5, clamped to 30).
+`poll(handle)` returns `{ status, result, err }` with `status` one of
+`"pending"`, `"ok"`, `"error"` or `"cancelled"`. `release(handle)` frees it.
+`available()` is `false` on a host without threads and for mods without the
+permission, so a probe is always safe.
+
+**A job is pure compute.** This is the part to design around, not a detail:
+
+- **Plain data in, plain data out.** Numbers, strings, booleans and tables of
+  them. A function, userdata, a cycle or a table key that is not a string or
+  number is refused at your `run` call with a reason. Nothing is shared —
+  your argument is snapshotted, and mutating the original afterwards does not
+  reach the job.
+- **No engine API, no game state, no storage.** `require` is refused inside a
+  job, and there is no `mod` object. A job cannot read the party, write
+  `mod.storage`, or touch a registry. Get what it needs into the argument and
+  act on the result back on the main thread.
+- **Your script is a file in your mod folder.** The path goes through the same
+  rules as `mod:read`; `..`, absolute paths and drive letters are refused.
+- **Two jobs per mod, four on the machine.** Over the limit, `run` returns
+  `nil` and a reason until you release one.
+- **The budget bounds how long YOU wait, not how long the work runs.** Past
+  `maxSeconds`, `poll` reports an error and the result is dropped if it ever
+  arrives — but the thread runs to its own end. There is no way to stop a
+  LÖVE thread from outside, and every attempt to stop one from inside was
+  worse than the disease (a debug hook does not reliably interrupt LuaJIT,
+  and raising from one wedged the whole process). `cancel(handle)` is the
+  same deal: it drops the result, it does not stop the work.
+
+  So **write jobs that terminate.** A job with an infinite loop will keep one
+  core busy until the game closes. It will not freeze the game — the main
+  thread stays responsive and quitting still works — but nothing will reclaim
+  that core in the meantime.
+
+Your job script runs in the same sandbox your entry file does, so `io`, `os`,
+`debug`, `ffi`, `package` and `love.filesystem` are absent there too. That is
+the whole reason this exists rather than `love.thread`: a raw LÖVE thread is a
+fresh Lua state with a full standard library that the sandbox cannot reach, so
+handing one to a mod would undo every other rule. Here the worker builds your
+sandbox first and loads your chunk into it.
+
+## Pre-sandbox globals (compat)
+
+A mod written before the sandbox landed does not have to be updated to
+load. `io`, `package`, `dofile`, `loadfile`, `os.getenv`, `love.filesystem`,
+`love.system` and `love.event` are all present again as compat stand-ins
+(`src/mods/LegacyCompat.lua`), and assigning a LÖVE callback
+(`love.mousemoved = fn`) installs on the real table the way it always did.
+Every stand-in call logs one warning naming its replacement, and
+`loader:legacyReport(modId)` returns the same list with call counts, which
+is what a "needs updating" badge should read.
+
+The stand-ins are not the old globals. Paths are classified rather than
+passed through:
+
+- A path inside your own mod directory reads the file you shipped.
+- Anything else, including an absolute path, resolves into a private
+  per-mod overlay at `mod_compat/<your id>/` under the save directory.
+  Two mods naming the same path never see each other's bytes, and nothing
+  is written outside the game tree.
+- A read misses through the overlay to your shipped file, then to
+  `mod.storage`, so a half-migrated mod sees both.
+- A write over a path you shipped shadows it; the packaged file is never
+  modified, and `mod:read` still returns the packaged bytes.
+- `love.filesystem.getSaveDirectory()` and `os.getenv("HOME")` answer with
+  a virtual root, so a legacy mod that joins its own paths lands back in
+  the same overlay.
+
+`love.thread` stays refused. A LÖVE thread runs in a separate Lua state
+with the full standard library, which the sandbox in this state cannot
+reach, so a stand-in would be a hole rather than a reroute. The same goes
+for `ffi`, `debug`, `setfenv`, `os.execute`, `io.popen`, `love.run` and
+`love.errorhandler`. A mod that needs real background work needs an
+engine-owned facility, not a compat shim -- for HTTP that facility is
+[`mod.fetch`](#modfetch), which runs on the engine's own worker pool.
