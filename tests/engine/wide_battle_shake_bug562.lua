@@ -147,8 +147,8 @@ T.eq(a[3].anchor, "bottom", "the message/menu strip uses the bottom window edge"
 T.eq(a[3].y, WideBattle.FIELD_BOTTOM,
   "the bottom strip begins at the wide battlefield boundary")
 local _, _, overlayAnchors = draw(nil, nil, {})
-T.eq(#overlayAnchors, 2,
-  "a pushed TextBox leaves the bottom strip in native battle coordinates")
+T.eq(#overlayAnchors, 0,
+  "a pushed battle overlay stays in front of every detached HUD region")
 
 -- -------------------------------------------------- horizontal shake (#562)
 -- TAIL WHIP is wAnimationType 6, AnimationShakeScreenHorizontallySlow b=3:

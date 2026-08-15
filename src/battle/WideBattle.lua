@@ -97,8 +97,18 @@ end
 -- deliberately battle-local escape hatch for screenshot A/B drivers; normal
 -- WIDE battles use the window layout.  The ordinary UI anchor gate remains
 -- held, so battle-owned TextBox / ChoiceBox states do not move with these.
+local function battleIsTopState(battle)
+  local stack = battle.game and battle.game.stack
+  return not (stack and stack.top) or stack:top() == battle
+end
+
 local function anchorHUD(battle, x, y, w, h, anchor)
   if battle.windowHUD == false then return end
+  -- Full-screen battle overlays own the UI above the still-running arena.
+  -- Since the detached HUD canvas is normally composited last, registering
+  -- these regions while NamingScreen/ListMenu/PartyMenu/BagMenu is topmost
+  -- would incorrectly place status panels in front of that newer screen.
+  if not battleIsTopState(battle) then return end
   local renderer = battle.game and battle.game.renderer
   if renderer and renderer.setBattleUIAnchor then
     -- Screen-shake translation is active while the HUD draws.  Capture the
@@ -114,11 +124,6 @@ local function anchorHUD(battle, x, y, w, h, anchor)
       renderer:setBattleUIAnchor(x, y, w, h, anchor)
     end
   end
-end
-
-local function battleIsTopState(battle)
-  local stack = battle.game and battle.game.stack
-  return not (stack and stack.top) or stack:top() == battle
 end
 
 -- One side's status box: name and level on the first line, a long HP bar
